@@ -113,33 +113,41 @@ function xeroSectionTotal(section, ci) {
   return sum;
 }
 
-/* Compute the four money metrics from one amount column (ci) of a P&L report. */
-function xeroColumnMetrics(report, ci) {
-  let revenue = 0, cogs = 0, opex = 0, wagesSuper = 0;
-  for (const row of xeroRows(report)) {
-    if (row.RowType !== 'Section') continue;
-    const title = String(row.Title || '').toLowerCase();
-    if (!title) continue;
-    const isOtherIncome = title.includes('other income');
-    const isCOGS = title.includes('cost of sales') || title.includes('cost of goods');
-    const isIncome = !isOtherIncome && !isCOGS &&
-      (title.includes('income') || title.includes('revenue') || title.includes('sales') ||
-       title.includes('turnover') || title.includes('trading'));
-    const isOpex = !isCOGS && !isIncome &&
-      (title.includes('operating expense') || title.includes('expense') || title.includes('overhead'));
-    if (isIncome) { revenue += xeroSectionTotal(row, ci); }
-    else if (isCOGS) { cogs += xeroSectionTotal(row, ci); }
-    else if (isOpex) {
-      opex += xeroSectionTotal(row, ci);
-      const rows = Array.isArray(row.Rows) ? row.Rows : [];
-      for (const r of rows) {
-        if (r.RowType === 'Row' && r.Cells && r.Cells[0] &&
-            XERO_WAGE_RE.test(String(r.Cells[0].Value || ''))) {
-          wagesSuper += xeroNum(r.Cells[ci] ? r.Cells[ci].Value : 0);
-        }
-      }
-    }
+/* Walk every row in a report, recursing into nested Section rows. */
+function xeroWalk(rows, cb) {
+  for (const r of (rows || [])) {
+    cb(r);
+    if (r && Array.isArray(r.Rows)) xeroWalk(r.Rows, cb);
   }
+}
+
+/* Compute the four money metrics from one amount column (ci) of a P&L report.
+   Layout-proof: reads the report's own header totals ("Total Income",
+   "Total Cost of Sales", "Total Operating Expenses") rather than trying to
+   re-classify each section, so it works whether Operating Expenses is one flat
+   section or grouped into subsections (Operating Costs / Overhead Costs / Staff
+   Expenses etc.). Wages+super are matched by account name anywhere in the report.
+   Overheads = Total Operating Expenses - wages/super (kpi-spec). Falls back to
+   summing post-Gross-Profit detail rows only if no operating-expenses total exists. */
+function xeroColumnMetrics(report, ci) {
+  let revenue = 0, cogs = 0, opexTotal = 0, wagesSuper = 0, expenseRowsSum = 0;
+  let sawOpexTotal = false, afterGross = false;
+  xeroWalk(xeroRows(report), (r) => {
+    const cells = r.Cells || [];
+    const label = String((cells[0] || {}).Value || '').trim();
+    const low = label.toLowerCase();
+    const amt = xeroNum(cells[ci] ? cells[ci].Value : 0);
+    if (low === 'gross profit') { afterGross = true; return; }
+    if (r.RowType === 'SummaryRow') {
+      if (low === 'total income' || low === 'total trading income') revenue += amt;
+      else if (low.indexOf('total cost of sales') === 0 || low.indexOf('total cost of goods') === 0) cogs += amt;
+      else if (low === 'total operating expenses') { opexTotal += amt; sawOpexTotal = true; }
+    } else if (r.RowType === 'Row') {
+      if (XERO_WAGE_RE.test(label)) wagesSuper += amt;
+      if (afterGross && low !== 'net profit' && low.indexOf('total ') !== 0) expenseRowsSum += amt;
+    }
+  });
+  const opex = sawOpexTotal ? opexTotal : expenseRowsSum;
   return { revenue, cogs, wagesSuper, overheads: opex - wagesSuper };
 }
 
@@ -908,25 +916,6 @@ export default {
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
-    }
-    if (path === '/api/debug/accounting' && request.method === 'GET') {
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      try {
-        const h = makeHelpers(env, 'accounting');
-        const t = await xeroTenant(h);
-        const from = url.searchParams.get('from') || '2026-06-01';
-        const to = url.searchParams.get('to') || '2026-06-30';
-        const report = await xeroReport(h, t.id, { fromDate: from, toDate: to });
-        const rows = xeroRows(report);
-        const sections = rows.filter((r) => r.RowType === 'Section').map((s) => ({
-          title: s.Title || '',
-          summary: (s.Rows || []).filter((r) => r.RowType === 'SummaryRow').map((r) => (r.Cells || []).map((c) => c.Value)),
-          rows: (s.Rows || []).filter((r) => r.RowType === 'Row').map((r) => ({ label: (r.Cells[0] || {}).Value, val: (r.Cells[1] || {}).Value }))
-        }));
-        return json({ org: t.name, topLevel: rows.map((r) => r.RowType + ':' + (r.Title || ((r.Cells && r.Cells[0] && r.Cells[0].Value) || ''))), sections, computed: xeroColumnMetrics(report, 1) });
-      } catch (e) {
-        return json({ error: String(e && e.message), status: e && e.status }, 500);
-      }
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
