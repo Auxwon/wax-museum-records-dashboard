@@ -909,6 +909,25 @@ export default {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
     }
+    if (path === '/api/debug/accounting' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      try {
+        const h = makeHelpers(env, 'accounting');
+        const t = await xeroTenant(h);
+        const from = url.searchParams.get('from') || '2026-06-01';
+        const to = url.searchParams.get('to') || '2026-06-30';
+        const report = await xeroReport(h, t.id, { fromDate: from, toDate: to });
+        const rows = xeroRows(report);
+        const sections = rows.filter((r) => r.RowType === 'Section').map((s) => ({
+          title: s.Title || '',
+          summary: (s.Rows || []).filter((r) => r.RowType === 'SummaryRow').map((r) => (r.Cells || []).map((c) => c.Value)),
+          rows: (s.Rows || []).filter((r) => r.RowType === 'Row').map((r) => ({ label: (r.Cells[0] || {}).Value, val: (r.Cells[1] || {}).Value }))
+        }));
+        return json({ org: t.name, topLevel: rows.map((r) => r.RowType + ':' + (r.Title || ((r.Cells && r.Cells[0] && r.Cells[0].Value) || ''))), sections, computed: xeroColumnMetrics(report, 1) });
+      } catch (e) {
+        return json({ error: String(e && e.message), status: e && e.status }, 500);
+      }
+    }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
