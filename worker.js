@@ -184,6 +184,34 @@ function xeroMultiMetrics(report) {
   return out;
 }
 
+/* ---------- Shopify (POS adapter) helpers ----------
+   POS supplies ONE number: the count of completed transactions (orders),
+   voids/cancelled excluded, refunds never reduce it (kpi-spec). Uses the Admin
+   GraphQL ordersCount with DATE-ONLY created_at bounds - Shopify applies the
+   store's timezone and returns an EXACT, stable count (timestamp-form filters
+   return approximate/rounded values, so they are deliberately not used). */
+const SHOPIFY_SHOP = 'wax-museum-records.myshopify.com';
+const SHOPIFY_API_VERSION = '2026-01';
+
+async function shopifyGraphql(env, h, query) {
+  const url = 'https://' + SHOPIFY_SHOP + '/admin/api/' + SHOPIFY_API_VERSION + '/graphql.json';
+  const res = await h.fetchJson(url, {
+    method: 'POST',
+    headers: { 'X-Shopify-Access-Token': env.POS_API_TOKEN || '', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query })
+  }, { auth: false });
+  if (res && res.errors && res.errors.length) { const e = new Error('shopify: ' + (res.errors[0].message || 'error')); e.status = 502; throw e; }
+  return res && res.data;
+}
+
+async function shopifyOrderCount(env, h, fromDate, toDate) {
+  const q = 'created_at:>=' + fromDate + ' created_at:<=' + toDate + ' -status:cancelled test:false';
+  const data = await shopifyGraphql(env, h, 'query { ordersCount(query: ' + JSON.stringify(q) + ') { count } }');
+  return (data && data.ordersCount && typeof data.ordersCount.count === 'number') ? data.ordersCount.count : 0;
+}
+
+function shopifyLastDay(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
@@ -272,12 +300,26 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const data = await shopifyGraphql(env, h, '{ shop { name } }');
+      return { connected: true, org: (data && data.shop && data.shop.name) || 'Shopify', sandbox: false };
+    },
+    async fetchRange(env, h, q) {
+      return { count: await shopifyOrderCount(env, h, q.from, q.to) };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = { months: months.slice(), count: [] };
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        out.count.push(await shopifyOrderCount(env, h, mo + '-01', mo + '-' + String(shopifyLastDay(y, m)).padStart(2, '0')));
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
