@@ -195,13 +195,17 @@ const SHOPIFY_API_VERSION = '2026-01';
 
 async function shopifyGraphql(env, h, query) {
   const url = 'https://' + SHOPIFY_SHOP + '/admin/api/' + SHOPIFY_API_VERSION + '/graphql.json';
-  const res = await h.fetchJson(url, {
-    method: 'POST',
-    headers: { 'X-Shopify-Access-Token': env.POS_API_TOKEN || '', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query })
-  }, { auth: false });
-  if (res && res.errors && res.errors.length) { const e = new Error('shopify: ' + (res.errors[0].message || 'error')); e.status = 502; throw e; }
-  return res && res.data;
+  const token = env.POS_API_TOKEN || '';
+  const body = JSON.stringify({ query });
+  const call = (headers) => fetch(url, { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, headers), body });
+  /* Classic Admin API tokens use X-Shopify-Access-Token; app automation tokens
+     (atkn_) authenticate via Authorization: Bearer. Try one, fall back to the other. */
+  let res = await call({ 'X-Shopify-Access-Token': token });
+  if (res.status === 401 || res.status === 403) res = await call({ 'Authorization': 'Bearer ' + token });
+  if (!res.ok) { const e = new Error('shopify http ' + res.status); e.status = res.status; throw e; }
+  const j = await res.json();
+  if (j && j.errors && j.errors.length) { const e = new Error('shopify: ' + (j.errors[0].message || 'error')); e.status = 502; throw e; }
+  return j && j.data;
 }
 
 async function shopifyOrderCount(env, h, fromDate, toDate) {
