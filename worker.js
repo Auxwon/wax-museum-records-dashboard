@@ -195,7 +195,8 @@ const SHOPIFY_API_VERSION = '2026-01';
 
 async function shopifyGraphql(env, h, query) {
   const url = 'https://' + SHOPIFY_SHOP + '/admin/api/' + SHOPIFY_API_VERSION + '/graphql.json';
-  const token = env.POS_API_TOKEN || '';
+  const tokens = await h.getTokens();
+  const token = (tokens && tokens.access_token) || env.POS_API_TOKEN || '';
   const body = JSON.stringify({ query });
   const call = (headers) => fetch(url, { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, headers), body });
   /* Classic Admin API tokens use X-Shopify-Access-Token; app automation tokens
@@ -305,10 +306,18 @@ const ADAPTERS = {
   */
   pos: {
     configured: true,
-    auth: 'token',
-    oauth: {},
+    auth: 'oauth',
+    oauth: {
+      authorizeUrl: 'https://' + SHOPIFY_SHOP + '/admin/oauth/authorize',
+      tokenUrl: 'https://' + SHOPIFY_SHOP + '/admin/oauth/access_token',
+      scopes: 'read_orders',
+      clientIdSecret: 'POS_CLIENT_ID',
+      clientSecretSecret: 'POS_CLIENT_SECRET',
+      tokenAuth: 'post'   /* Shopify wants client_id/client_secret in the form body */
+    },
     async status(env, h) {
-      if (!env.POS_API_TOKEN) return { connected: false };
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
       const data = await shopifyGraphql(env, h, '{ shop { name } }');
       return { connected: true, org: (data && data.shop && data.shop.name) || 'Shopify', sandbox: false };
     },
